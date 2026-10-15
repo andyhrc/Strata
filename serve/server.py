@@ -797,6 +797,8 @@ class StrataEngine:
         self.session_save_reclaim = '--session-save-reclaim' in args
         # Opt-in Python scheduling only; preserved by restart() through spawn's environment.
         self.slot_cache_trace = (env if env is not None else os.environ).get("STRATA_CACHE_TRACE") == "1"
+        # local diagnostic (not upstream): STRATA_CACHE_DIVERGENCE_LOG=1 prints where a prompt splits from a slot's history
+        self.cache_divergence_log = (env if env is not None else os.environ).get("STRATA_CACHE_DIVERGENCE_LOG") == "1"
         self.slot_cache_affinity = (env if env is not None else os.environ).get("STRATA_SLOT_CACHE_AFFINITY") == "1"
         self.slot_policy_settings = slot_policy.configure(env if env is not None else os.environ)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -1689,6 +1691,16 @@ class StrataEngine:
                 tl.cache_debug = snapshot(ids, self.slot_held, self.slot_busy,
                     getattr(self, "slot_cache_valid", [True] * self.batch), self.slot_used, time.time())
             self.cache_event("request_start", prompt_tokens=len(ids), cache_debug=tl.cache_debug)
+            if getattr(self, "cache_divergence_log", False):
+                # the slot sharing the most of this prompt, when it splits before its own end (and after half of it)
+                rows = [r for r in tl.cache_debug["slots"] if r["held_tokens"] and not r["full_prefix_match"] and
+                        r["held_tokens"] // 2 <= r["common_prefix_tokens"] < min(r["held_tokens"], len(ids))]
+                best = max(rows, key=lambda r: r["common_prefix_tokens"], default=None)
+                if best is not None:
+                    c, held = best["common_prefix_tokens"], self.slot_held[best["slot"]]
+                    tl.cache_divergence = {"slot": best["slot"], "held": len(held), "prompt": len(ids), "common": c,
+                                           "before": list(ids[max(0, c - 80):c]), "cached": list(held[c:c + 80]),
+                                           "sent": list(ids[c:c + 80])}
         peer_ip = getattr(self.__dict__.setdefault("_tl", threading.local()), "peer_ip", None)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -4015,6 +4027,20 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
+    def _log_cache_divergence(self, request_key) -> dict:
+        """Local diagnostic (STRATA_CACHE_DIVERGENCE_LOG=1): print the text around the split the engine thread noted for
+        this request - the same start, then what the slot's cache holds and what the client sent.  Adds no fields."""
+        tl = getattr(self.engine, "_tl", None)
+        div = getattr(tl, "cache_divergence", None)
+        if div:
+            tl.cache_divergence = None
+            dec = lambda t: self.tok.decode([int(x) for x in t])
+            print(f"[strata] cache split (STRATA_CACHE_DIVERGENCE_LOG): request {request_key} - slot {div['slot']} holds "
+                  f"{div['held']} tokens, the prompt {div['prompt']}, the same for {div['common']}\n"
+                  f"  same    ...{dec(div['before'])!r}\n  cached  {dec(div['cached'])!r}\n  sent    {dec(div['sent'])!r}",
+                  flush=True)
+        return {}
+
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
@@ -4585,6 +4611,7 @@ class Service:
             context.peer_ip = peer_ip
             context.api_request_key = api_request_key
             context.cache_debug = None
+            context.cache_divergence = None
             context.executed_slot = None
             context.cache_source_slot = None
             context.cache_match_hint = None
@@ -4901,6 +4928,7 @@ class Service:
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
+                                **self._log_cache_divergence(api_request_key),
                                 "request_key": api_request_key,
                                 "slot": getattr(getattr(self.engine, "_tl", None), "executed_slot", None),
                                 "cache_source_slot": getattr(getattr(self.engine, "_tl", None), "cache_source_slot", None),
