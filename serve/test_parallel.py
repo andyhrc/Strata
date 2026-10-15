@@ -407,6 +407,9 @@ class ParallelService(unittest.TestCase):
         live = self.get("/metrics")["live"]
         self.assertEqual([live[k] for k in ("solo_peer_ip", "solo_request_key", "solo_cache_source_slot",
                                             "solo_cache_reused_tokens")], [None] * 4)
+        # and the main session holds its conversation, and says whose it is
+        self.assertGreater(live["main_held_tokens"], 0)
+        self.assertEqual(live["main_peer_ip"], "127.0.0.1")
 
     def test_solo_completion_records_actual_last_use_of_main_cache(self):
         self.start(2, says_groups=2, affinity=True)
