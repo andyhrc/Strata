@@ -440,6 +440,15 @@ class ParallelService(unittest.TestCase):
         self.assertTrue(all(s["state"] == "idle" for s in observed["slots"]))
         self.assertIn("reply", out)
 
+    def test_solo_completion_records_actual_last_use_of_main_cache(self):
+        self.start(2, says_groups=2, affinity=True)
+        self.engine.main_used = time.time() - 3600
+        before = time.time()
+        self.chat('hello', max_tokens=8)
+        self.assertTrue(self.engine.main_held)
+        self.assertGreaterEqual(self.engine.main_used, before)
+        self.assertLessEqual(self.engine.main_used, time.time())
+
     def test_http_peer_is_recorded_without_trusting_forwarded_ip(self):
         self.start(2, says_groups=2, affinity=True)
         body = {"messages": [{"role": "user", "content": "hello"}],
