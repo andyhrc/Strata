@@ -3994,6 +3994,9 @@ class Service:
                         solo_cache_source_slot=getattr(self.engine, "solo_cache_source_slot", None),
                         solo_cache_reused_tokens=getattr(self.engine, "solo_cache_reused_tokens", None),
                         solo_request_key=getattr(self.engine, "solo_request_key", None),
+                        # the conversation the main session holds between solo requests, and whose it is
+                        main_held_tokens=len(getattr(self.engine, "main_held", None) or []),
+                        main_peer_ip=getattr(self.engine, "main_peer", None),
                         parallel=par, running=running, slots=slots, outside_slots=max(0, running - in_slots),
                         waiting=int(getattr(self.engine, "waiting", 0) or 0),
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))

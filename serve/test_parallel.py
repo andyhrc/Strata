@@ -439,6 +439,10 @@ class ParallelService(unittest.TestCase):
         self.assertTrue(observed["solo_request_key"])
         self.assertTrue(all(s["state"] == "idle" for s in observed["slots"]))
         self.assertIn("reply", out)
+        # after the solo request the main session holds its conversation, and says whose it is
+        live = self.get("/metrics")["live"]
+        self.assertGreater(live["main_held_tokens"], 0)
+        self.assertEqual(live["main_peer_ip"], "127.0.0.1")
 
     def test_solo_completion_records_actual_last_use_of_main_cache(self):
         self.start(2, says_groups=2, affinity=True)
