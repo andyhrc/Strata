@@ -12793,6 +12793,7 @@ int main(int argc, char** argv) {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
+                    bool took_checks = false;
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
                         resume_plan = bs[(size_t) slot_source].partial_plan;
@@ -12801,6 +12802,7 @@ int main(int argc, char** argv) {
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                         bs[(size_t) slot_source].partial_plan = {};
+                        took_checks = true;
                     }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
@@ -12827,11 +12829,14 @@ int main(int argc, char** argv) {
                         checks.back().used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
-                        // its checkpoints of this conversation come back with it: moved into the slot at its admission
-                        // (STRATA_SLOT_CKPT_MOVE), they are the chain's only ones, and the admission below keeps them
-                        // again - a later turn that rewrites the end of this one (its thinking dropped) resumes there
-                        const bool move = slot_ckpt_move_env() || admit_slot == slot_source;
-                        if (checks.empty() && (move || slot_multi)) {
+                        // #1906: the slot's turn checkpoints come along with its conversation.  The main session now holds
+                        // all of it, so each one is still a valid place to continue from - and the client's next turn,
+                        // sent back without this reply's thinking, matches only up to the turn boundary.  Without them
+                        // a request that moved slot -> solo -> slot (#857) kept none, and its next turn read its whole
+                        // history again.  Moved into the slot at its admission (STRATA_SLOT_CKPT_MOVE) they are the
+                        // chain's only ones and move back, as into the same slot; else they are copied
+                        if (!took_checks) {
+                            const bool move = slot_ckpt_move_env() || admit_slot == slot_source;
                             std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
                             std::vector<ConvCheckpoint> rest;
                             for (ConvCheckpoint& c : sc) {
