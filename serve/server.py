@@ -30,6 +30,7 @@ import base64
 import hashlib
 import hmac
 import codecs
+import ipaddress
 import ctypes
 import json
 import math
@@ -3463,6 +3464,8 @@ class Service:
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
+        # local: the clients this server answers (allowed_ips_file / $STRATA_ALLOWED_IPS_FILE); None = any
+        self.allowed_ips: AllowedIPs | None = None
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
@@ -5600,10 +5603,19 @@ def make_handler(svc: Service):
                 pass
 
         def parse_request(self):
-            """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
+            """With an allowed_ips_file, every request (any method) first comes from an address on it or from this PC.
+            Without an API key, every request then passes the Host check: DNS rebinding protection
             (host_allowed).  With a key a rebinding page cannot authenticate, so the check is skipped: tunnels and
             proxies that pass their own name on keep working."""
             if not super().parse_request():
+                return False
+            ip = self.client_address[0]
+            if svc.allowed_ips is not None and not svc.allowed_ips.allows(ip):
+                if svc.allowed_ips.log_refusal(ip):
+                    print(f"[strata] refused a request from {ip}: not in {svc.allowed_ips.path} (allowed_ips_file)",
+                          flush=True)
+                self.close_connection = True
+                self._json(403, {"error": {"type": "forbidden", "message": f"{ip} may not use this server"}})
                 return False
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
@@ -6729,6 +6741,83 @@ def _name_in(name: str, names) -> bool:
     return name in names or any(n.startswith(".") and (name.endswith(n) or name == n[1:]) for n in names)
 
 
+class AllowedIPs:
+    """local: allowed_ips_file / $STRATA_ALLOWED_IPS_FILE - the clients this server answers, one address or network
+    per line (192.168.1.20, 10.0.0.0/24; the rest of a line and # comments are ignored), and this PC (loopback) always.
+    The file is read again when it changes (looked at once a RECHECK_S at most), so a tool that rewrites it changes
+    the next request's answer without a restart; a file that goes missing or wrong later keeps the last good list."""
+    RECHECK_S = 1.0
+    REFUSAL_LOG_S = 60.0          # a refused address is logged once a minute, not on every request
+    REFUSALS_KEPT = 4096          # addresses remembered for that; a scan of many addresses starts the memory over
+
+    def __init__(self, path: str):
+        self.path, self.lock = path, threading.Lock()
+        self.stamp, self.checked, self.refused = self.stat(), time.monotonic(), {}
+        self.nets = self.read()   # a list that cannot be read at the start stops the start (ValueError)
+
+    def stat(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size, st.st_ino
+
+    def read(self) -> list:
+        try:
+            text = Path(self.path).read_text(encoding="utf-8")
+        except OSError as e:
+            raise ValueError(f"cannot read {self.path}: {e.strerror or e}") from None
+        nets = []
+        for n, line in enumerate(text.splitlines(), 1):
+            words = line.split("#", 1)[0].split()
+            if words:
+                try:
+                    nets.append(ipaddress.ip_network(words[0]))
+                except ValueError:
+                    raise ValueError(f"{self.path} line {n}: {words[0]!r} is not an address or network like "
+                                     f"192.168.1.20 or 10.0.0.0/24") from None
+        return nets
+
+    def reload(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            if now - self.checked < self.RECHECK_S:
+                return
+            self.checked = now
+            stamp = self.stat()
+            if stamp == self.stamp:
+                return
+            self.stamp = stamp
+            try:
+                self.nets = self.read()
+            except ValueError as e:
+                print(f"[strata] {e}: the last list ({len(self.nets)} entries) stays", flush=True)
+                return
+        print(f"[strata] allowed clients: {len(self.nets)} entries from {self.path} (allowed_ips_file)", flush=True)
+
+    def allows(self, address: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+        except ValueError:
+            return False
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if ip.is_loopback:
+            return True
+        self.reload()
+        return any(ip in net for net in self.nets)
+
+    def log_refusal(self, address: str) -> bool:
+        with self.lock:
+            now = time.monotonic()
+            if now - self.refused.get(address, -self.REFUSAL_LOG_S) < self.REFUSAL_LOG_S:
+                return False
+            if len(self.refused) >= self.REFUSALS_KEPT:
+                self.refused.clear()
+            self.refused[address] = now
+            return True
+
+
 def allowed_hosts_of(value, env: str = "") -> list[str]:
     """The config's allowed_hosts (a name or a list) plus $STRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
     ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
@@ -7375,6 +7464,14 @@ def main() -> int:
         svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
+    allowed_ips = cfg.get("allowed_ips_file") or os.environ.get("STRATA_ALLOWED_IPS_FILE", "")
+    if allowed_ips:
+        try:
+            svc.allowed_ips = AllowedIPs(allowed_ips)
+        except ValueError as e:
+            raise SystemExit(f"[strata] allowed_ips_file: {e}")
+        print(f"[strata] answers only this PC and the {len(svc.allowed_ips.nets)} addresses/networks in {allowed_ips} "
+              f"(allowed_ips_file, read again when it changes)", flush=True)
     if svc.allowed_hosts:
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
