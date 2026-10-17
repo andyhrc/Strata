@@ -800,6 +800,10 @@ class StrataEngine:
         self.slot_cache_trace = (env if env is not None else os.environ).get("STRATA_CACHE_TRACE") == "1"
         # local diagnostic (not upstream): STRATA_CACHE_DIVERGENCE_LOG=1 prints where a prompt splits from a slot's history
         self.cache_divergence_log = (env if env is not None else os.environ).get("STRATA_CACHE_DIVERGENCE_LOG") == "1"
+        # local diagnostic (not upstream): STRATA_SPILL_ESTIMATE_LOG=<file> appends a line per request, to estimate
+        # what a disk cache of the conversations the engine drops would restore and write
+        self.spill_estimate_log = (env if env is not None else os.environ).get("STRATA_SPILL_ESTIMATE_LOG") or None
+        self.spill_lock = threading.Lock()
         self.slot_cache_affinity = (env if env is not None else os.environ).get("STRATA_SLOT_CACHE_AFFINITY") == "1"
         self.slot_policy_settings = slot_policy.configure(env if env is not None else os.environ)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
@@ -1209,6 +1213,27 @@ class StrataEngine:
                 with self.slot_cv:               # #1012: wake the requests that waited through it: they go on with the
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
+
+    def _log_spill_estimate(self, ids, out, slot):
+        """Local diagnostic (STRATA_SPILL_ESTIMATE_LOG=<file>, not upstream): one JSON line per request - the
+        conversation it leaves (prompt and reply) as a running hash per 256 tokens, where its turns start and the
+        engine's figures, no text.  benchmarks/claude-diag-20261014/spill_estimate.py replays them against a disk
+        cache."""
+        try:
+            held = [int(t) for t in ids] + [int(t) for t in out]
+            h, blocks = hashlib.blake2b(digest_size=8), []
+            for i in range(0, len(held) - 255, 256):
+                h.update(struct.pack("<256i", *held[i:i + 256]))
+                blocks.append(h.hexdigest()[:12])
+            last = self.last if isinstance(self.last, dict) else {}
+            rec = {"t": round(time.time(), 3), "n": len(ids), "out": len(out), "reused": last.get("reused"),
+                   "prompt_ms": last.get("prompt_ms"), "slot": slot, "blocks": blocks,
+                   "turns": [i for i, t in enumerate(ids) if int(t) == self.TURN_ID]}
+            with self.spill_lock:
+                with open(self.spill_estimate_log, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        except Exception as e:   # (a diagnostic never fails a request)
+            print(f"[strata] STRATA_SPILL_ESTIMATE_LOG: {e!r}", flush=True)
 
     def _parse_done(self, line):
         f = line.split()
@@ -2045,6 +2070,8 @@ class StrataEngine:
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
                 self.last = add_carry(carry, self.last)
+            if getattr(self, "spill_estimate_log", None):
+                self._log_spill_estimate(ids, out, slot)
             if park_slot is not None:
                 self._release_park(park_slot)
             if solo_leg is not None:
