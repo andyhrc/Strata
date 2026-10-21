@@ -420,6 +420,25 @@ class ImageMarkers(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertNotIn("img_keys", StrataEngine.sampling_keys({"strata_img_keys": bad}))
 
+    def test_the_history_counts_a_requests_pictures(self):
+        """local: each request's record says how many pictures its prompt has (0 without any), for the monitor."""
+        import tempfile
+        tok = ByteTokenizer()
+        with tempfile.TemporaryDirectory() as d:
+            class Keyed(self.FakeVision):
+                def encode(self, source):
+                    p = self.dir / (source[0] * 32 + ".sve")
+                    p.write_bytes(b"rows")
+                    return p, 3
+            svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                          vision=Keyed(d))
+            for content, want in (([{"type": "image", "source": "a.png"}, {"type": "text", "text": "and"},
+                                    {"type": "image", "source": "b.png"}], 2), ("plain", 0)):
+                ids, _, _ = svc.prepare([{"role": "user", "content": content}], None, {})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    list(svc.run(ids, False, None, 4, {}, threading.Event()))
+                self.assertEqual(svc.history[-1]["images"], want)
+
     def test_anthropic_tool_result_image(self):
         """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
         import tempfile

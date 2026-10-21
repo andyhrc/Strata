@@ -6086,6 +6086,9 @@ class Service:
                                 "first_engine_token_s": first_engine_token_s,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                # local (not upstream): the pictures in this request's prompt, for our monitor (a prompt
+                                # with pictures resumes only from the main session's live state, never an idle slot)
+                                "images": len(img_keys) if emb and img_keys else 0,
                                 "reasoning_recoveries": recovery_count,
                                 "reasoning_repeat_coverage": round(repeat_coverage, 3),
                                 "engine_generated": last.get("generated"),
